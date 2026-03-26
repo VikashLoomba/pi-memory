@@ -132,30 +132,103 @@ function parseFactsFromTextFallback(message: AssistantMessage): ExtractedFact[] 
 	}
 }
 
-export async function extractFacts(
-	recentEpisodes: string[],
+const ENTITY_EXTRACTION_PROMPT = `You are a memory consolidation worker for an AI memory system.
+
+Phase 1: Read the conversation episodes below and identify all important ENTITIES mentioned.
+For each entity, provide its name and type (user, person, project, organization, tool, language, concept).
+
+Focus on entities that are durable and reusable — skip transient or one-off mentions.
+
+You MUST call the emit_entities tool exactly once.`;
+
+const EmitEntitiesTool = {
+	name: "emit_entities",
+	description: "Emit the entities identified in the conversation episodes.",
+	parameters: Type.Object({
+		entities: Type.Array(
+			Type.Object({
+				name: Type.String({ description: "Entity name" }),
+				type: Type.String({ description: "Entity type: user, person, project, organization, tool, language, concept" }),
+			}),
+		),
+	}),
+};
+
+const RELATIONSHIP_EXTRACTION_PROMPT = `You are a memory consolidation worker for an AI memory system.
+
+Phase 2: Given the conversation episodes and the entities already identified, extract durable RELATIONSHIPS between entities.
+
+Known entities:
+{ENTITY_LIST}
+
+Extract facts about:
+- user preferences
+- project context and technology choices
+- recurring workflows and behaviors
+- stable relationship facts that future turns would benefit from
+
+Do NOT extract:
+- transient one-off requests
+- implementation details that are obviously temporary
+- low-confidence guesses
+- sensitive facts unless they are clearly necessary and explicit in the conversation
+
+You MUST call the emit_durable_facts tool exactly once.
+Return an empty facts array if nothing durable should be remembered.`;
+
+const SUB_BATCH_SIZE = 4;
+
+async function extractFactsSingleBatch(
+	episodes: string[],
 	model: Model<any>,
 	apiKey: string,
-	options: ExtractFactsOptions = {},
-): Promise<ConsolidationResult> {
-	const completeFn = options.completeFn ?? complete;
-	const timestamp = options.now?.() ?? Date.now();
-
+	completeFn: typeof complete,
+	timestamp: number,
+): Promise<{ facts: ExtractedFact[]; toolUsed: boolean; rawAssistant: AssistantMessage }> {
 	const userMessage: Message = {
 		role: "user",
 		content: [
 			{
 				type: "text",
-				text: recentEpisodes.map((episode, index) => `--- Episode ${index + 1} ---\n${episode}`).join("\n\n"),
+				text: episodes.map((episode, index) => `--- Episode ${index + 1} ---\n${episode}`).join("\n\n"),
 			},
 		],
 		timestamp,
 	};
 
+	// Phase 1: Extract entities
+	let entityHints: string[] = [];
+	try {
+		const entityAssistant = await completeFn(
+			model,
+			{
+				systemPrompt: ENTITY_EXTRACTION_PROMPT,
+				messages: [userMessage],
+				tools: [EmitEntitiesTool],
+			},
+			{ apiKey, temperature: 0 },
+		);
+
+		const entityCalls = entityAssistant.content.filter(isToolCall).filter((call) => call.name === EmitEntitiesTool.name);
+		for (const call of entityCalls) {
+			const args = call.arguments as { entities?: Array<{ name: string; type: string }> };
+			if (Array.isArray(args.entities)) {
+				entityHints = args.entities.map((e) => `${e.name} (${e.type})`);
+			}
+		}
+	} catch {
+		// If entity extraction fails, continue with relationship extraction without hints
+	}
+
+	// Phase 2: Extract relationships (with entity hints if available)
+	const systemPrompt = entityHints.length > 0
+		? RELATIONSHIP_EXTRACTION_PROMPT.replace("{ENTITY_LIST}", entityHints.join(", "))
+		: EXTRACTION_SYSTEM_PROMPT;
+
 	const assistant = await completeFn(
 		model,
 		{
-			systemPrompt: EXTRACTION_SYSTEM_PROMPT,
+			systemPrompt,
 			messages: [userMessage],
 			tools: [EmitDurableFactsTool],
 		},
@@ -169,4 +242,37 @@ export async function extractFacts(
 
 	const fallbackFacts = parseFactsFromTextFallback(assistant);
 	return { facts: fallbackFacts, rawAssistant: assistant, toolUsed: false };
+}
+
+export async function extractFacts(
+	recentEpisodes: string[],
+	model: Model<any>,
+	apiKey: string,
+	options: ExtractFactsOptions = {},
+): Promise<ConsolidationResult> {
+	const completeFn = options.completeFn ?? complete;
+	const timestamp = options.now?.() ?? Date.now();
+
+	// Sub-batch episodes for better extraction quality
+	if (recentEpisodes.length <= SUB_BATCH_SIZE) {
+		return extractFactsSingleBatch(recentEpisodes, model, apiKey, completeFn, timestamp);
+	}
+
+	const allFacts: ExtractedFact[] = [];
+	let lastAssistant: AssistantMessage | null = null;
+	let anyToolUsed = false;
+
+	for (let i = 0; i < recentEpisodes.length; i += SUB_BATCH_SIZE) {
+		const batch = recentEpisodes.slice(i, i + SUB_BATCH_SIZE);
+		const result = await extractFactsSingleBatch(batch, model, apiKey, completeFn, timestamp);
+		allFacts.push(...result.facts);
+		lastAssistant = result.rawAssistant;
+		if (result.toolUsed) anyToolUsed = true;
+	}
+
+	return {
+		facts: dedupeFacts(allFacts),
+		rawAssistant: lastAssistant!,
+		toolUsed: anyToolUsed,
+	};
 }
