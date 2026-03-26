@@ -1,0 +1,34 @@
+{
+  "name": "pi-memory",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MemTrust-inspired AI memory system for Pi — Episodic Memory, Profile Memory, and Adaptive Forgetting",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "clean": "rm -rf node_modules",
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test --test-force-exit tests/**/*.test.ts"
+  },
+  "dependencies": {
+    "@mariozechner/pi-agent-core": "^0.62.0",
+    "@mariozechner/pi-ai": "^0.62.0",
+    "@mariozechner/pi-coding-agent": "^0.62.0",
+    "@sinclair/typebox": "^0.34.41",
+    "@surrealdb/node": "^3.0.3",
+    "better-sqlite3": "^11.9.1",
+    "openai": "^4.96.0",
+    "sqlite-vec": "^0.1.7",
+    "surrealdb": "^2.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
+  }
+}
