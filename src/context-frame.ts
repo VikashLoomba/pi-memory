@@ -7,6 +7,8 @@
 
 import type { Episode } from "./episodic.js";
 import type { Relationship } from "./profile.js";
+import type { ScoredMemoryItem } from "./ranking.js";
+import { unmaskPii, deserializeMasks } from "./pii.js";
 
 export interface ContextFrameOptions {
 	maxTokens: number;
@@ -94,6 +96,55 @@ export function buildContextFrame(
 	if (factSection) {
 		frame += factSection;
 	}
+	frame += `</MemoryContext>`;
+
+	return {
+		frame: usedEpisodes === 0 && usedFacts === 0 ? "" : frame,
+		usedEpisodes,
+		usedFacts,
+		estimatedTokens: approximateTokens(frame),
+	};
+}
+
+export function buildContextFrameFromRanked(
+	rankedItems: ScoredMemoryItem[],
+	options: ContextFrameOptions,
+): ContextFrameResult {
+	const maxTokens = Math.max(256, options.maxTokens);
+
+	let frame = `<MemoryContext>\n`;
+	let usedEpisodes = 0;
+	let usedFacts = 0;
+	let sectionContent = "";
+
+	for (const entry of rankedItems) {
+		let item: string;
+		if (entry.type === "episode") {
+			const episode = entry.item as Episode;
+			// Unmask PII so the model sees real values in context
+			let content = episode.content.trim();
+			if (episode.piiMasks) {
+				const masks = deserializeMasks(episode.piiMasks);
+				content = unmaskPii(content, masks);
+			}
+			item =
+				`  <RecentEpisode source="${escapeXml(episode.sourceApp)}" age="${formatAge(episode.timestamp)}">` +
+				`${escapeXml(truncate(content, 700))}</RecentEpisode>\n`;
+		} else {
+			const rel = entry.item as Relationship;
+			item =
+				`  <ProfileFact confidence="${rel.confidence.toFixed(2)}">` +
+				`${escapeXml(rel.source)} ${escapeXml(rel.relation)} ${escapeXml(rel.target)}` +
+				`</ProfileFact>\n`;
+		}
+
+		if (approximateTokens(sectionContent + item) > maxTokens) break;
+		sectionContent += item;
+		if (entry.type === "episode") usedEpisodes++;
+		else usedFacts++;
+	}
+
+	if (sectionContent) frame += sectionContent;
 	frame += `</MemoryContext>`;
 
 	return {

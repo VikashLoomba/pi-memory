@@ -13,6 +13,7 @@ function makeEpisode(overrides: Partial<Episode> = {}): Episode {
 		memoryStrength: 1,
 		lastAccessed: Date.now(),
 		consolidated: false,
+		piiMasks: null,
 		...overrides,
 	};
 }

@@ -13,6 +13,7 @@ import * as sqliteVec from "sqlite-vec";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { applySyncMigrations } from "./migrations.js";
+import { generateDuk, encrypt, decrypt, serializeEncrypted, deserializeEncrypted } from "./crypto.js";
 
 export const EMBEDDING_DIMENSIONS = 3072; // OpenAI text-embedding-3-large
 
@@ -24,6 +25,7 @@ export interface Episode {
 	memoryStrength: number;
 	lastAccessed: number;
 	consolidated: boolean;
+	piiMasks: string | null;
 }
 
 export interface EpisodicStats {
@@ -32,10 +34,14 @@ export interface EpisodicStats {
 	unconsolidatedCount: number;
 }
 
+export interface EpisodeWithDistance extends Episode {
+	distance: number;
+}
+
 export interface EpisodicStore {
 	init(): void;
-	insert(content: string, embedding: Float32Array, sourceApp: string): Episode;
-	query(embedding: Float32Array, limit?: number): Episode[];
+	insert(content: string, embedding: Float32Array, sourceApp: string, piiMasks?: string | null): Episode;
+	query(embedding: Float32Array, limit?: number): EpisodeWithDistance[];
 	reinforce(id: number): void;
 	getUnconsolidated(limit?: number): Episode[];
 	countUnconsolidated(): number;
@@ -50,6 +56,7 @@ export interface EpisodicStore {
 
 export interface EpisodicStoreOptions {
 	now?: () => number;
+	cryptoShredding?: boolean;
 }
 
 function assertEmbeddingDimensions(embedding: Float32Array): void {
@@ -73,15 +80,30 @@ function mapEpisodeRow(row: {
 	memory_strength: number;
 	last_accessed: number;
 	consolidated: number;
+	pii_masks?: string | null;
+	duk?: string | null;
 }): Episode {
+	let content = row.content;
+	// If a DUK exists, content is encrypted — decrypt it
+	if (row.duk) {
+		const payload = deserializeEncrypted(content);
+		if (payload) {
+			try {
+				content = decrypt(payload, row.duk);
+			} catch {
+				content = "[encrypted — decryption failed]";
+			}
+		}
+	}
 	return {
 		id: row.id,
-		content: row.content,
+		content,
 		sourceApp: row.source_app,
 		timestamp: row.timestamp,
 		memoryStrength: row.memory_strength,
 		lastAccessed: row.last_accessed,
 		consolidated: row.consolidated === 1,
+		piiMasks: row.pii_masks ?? null,
 	};
 }
 
@@ -90,6 +112,7 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 	const dbPath = join(dataDir, "episodic.sqlite");
 	const db = new Database(dbPath);
 	const now = options.now ?? (() => Date.now());
+	const useCrypto = options.cryptoShredding ?? false;
 
 	db.pragma("journal_mode = WAL");
 	db.pragma("foreign_keys = ON");
@@ -133,14 +156,26 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 					`);
 				},
 			},
+			{
+				version: 2,
+				description: "Add PII masks and encryption key columns",
+				up: () => {
+					db.exec(`
+						ALTER TABLE episodes ADD COLUMN pii_masks TEXT DEFAULT NULL;
+						ALTER TABLE episodes ADD COLUMN duk TEXT DEFAULT NULL;
+						ALTER TABLE episodes_cold ADD COLUMN pii_masks TEXT DEFAULT NULL;
+						ALTER TABLE episodes_cold ADD COLUMN duk TEXT DEFAULT NULL;
+					`);
+				},
+			},
 		]);
 	};
 
 	initializeSchema();
 
 	const insertMetaStmt = db.prepare(`
-		INSERT INTO episodes (content, source_app, timestamp, memory_strength, last_accessed, consolidated)
-		VALUES (?, ?, ?, 1.0, ?, 0)
+		INSERT INTO episodes (content, source_app, timestamp, memory_strength, last_accessed, consolidated, pii_masks, duk)
+		VALUES (?, ?, ?, 1.0, ?, 0, ?, ?)
 	`);
 	const insertVecStmt = db.prepare(`
 		INSERT INTO episodes_vec (rowid, embedding)
@@ -155,9 +190,9 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 	const markConsolidatedStmt = db.prepare(`UPDATE episodes SET consolidated = 1 WHERE id = ?`);
 	const archiveStmt = db.prepare(`
 		INSERT INTO episodes_cold (
-			id, content, source_app, timestamp, memory_strength, last_accessed, consolidated, archived_at
+			id, content, source_app, timestamp, memory_strength, last_accessed, consolidated, archived_at, pii_masks
 		)
-		SELECT id, content, source_app, timestamp, memory_strength, last_accessed, consolidated, ?
+		SELECT id, content, source_app, timestamp, memory_strength, last_accessed, consolidated, ?, pii_masks
 		FROM episodes
 		WHERE id = ?
 	`);
@@ -169,12 +204,20 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 			initializeSchema();
 		},
 
-		insert(content: string, embedding: Float32Array, sourceApp: string): Episode {
+		insert(content: string, embedding: Float32Array, sourceApp: string, piiMasks: string | null = null): Episode {
 			const timestamp = now();
 			const embeddingJson = embeddingToJson(embedding);
 
+			// Encrypt content if crypto-shredding is enabled
+			let storedContent = content;
+			let duk: string | null = null;
+			if (useCrypto) {
+				duk = generateDuk();
+				storedContent = serializeEncrypted(encrypt(content, duk));
+			}
+
 			const insertTxn = db.transaction(() => {
-				const info = insertMetaStmt.run(content, sourceApp, timestamp, timestamp);
+				const info = insertMetaStmt.run(storedContent, sourceApp, timestamp, timestamp, piiMasks, duk);
 				insertVecStmt.run(embeddingJson);
 				const id = Number(info.lastInsertRowid);
 				const row = db
@@ -189,7 +232,9 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 			return insertTxn();
 		},
 
-		query(embedding: Float32Array, limit = 5): Episode[] {
+		query(embedding: Float32Array, limit = 5): EpisodeWithDistance[] {
+			// Over-fetch 3x candidates for better re-ranking by fusion scorer
+			const overFetchLimit = limit * 3;
 			const rows = db
 				.prepare(`
 					SELECT
@@ -200,6 +245,8 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 						e.memory_strength,
 						e.last_accessed,
 						e.consolidated,
+						e.pii_masks,
+						e.duk,
 						v.distance
 					FROM episodes_vec v
 					JOIN episodes e ON e.id = v.rowid
@@ -207,9 +254,10 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 					  AND k = ?
 					ORDER BY v.distance ASC, e.timestamp DESC
 				`)
-				.all(embeddingToJson(embedding), limit) as (Parameters<typeof mapEpisodeRow>[0] & { distance: number })[];
+				.all(embeddingToJson(embedding), overFetchLimit) as (Parameters<typeof mapEpisodeRow>[0] & { distance: number })[];
 
-			return rows.map(mapEpisodeRow);
+			// Return all over-fetched candidates; caller (fusion ranking) handles final selection
+			return rows.map((row) => ({ ...mapEpisodeRow(row), distance: row.distance }));
 		},
 
 		reinforce(id: number) {
@@ -272,6 +320,12 @@ export function createEpisodicStore(dataDir: string, options: EpisodicStoreOptio
 				}
 			});
 			txn(ids);
+			// Optimize vector index after removing entries
+			try {
+				db.exec("INSERT INTO episodes_vec(episodes_vec) VALUES('optimize')");
+			} catch {
+				// optimize command may not be supported on all sqlite-vec versions
+			}
 		},
 
 		listRecent(limit = 10): Episode[] {

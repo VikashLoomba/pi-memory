@@ -156,6 +156,34 @@ export function createProfileStore(dataDir: string, options: ProfileStoreOptions
 		return (result[0] ?? []).map(asRelationship);
 	}
 
+	async function findSeedEntities(keywords: string[]): Promise<unknown[]> {
+		const ids: unknown[] = [];
+		const seen = new Set<string>();
+		for (const kw of keywords) {
+			const result = await db.query<[Array<{ id: unknown }>]>(
+				`SELECT id FROM entity WHERE normalized_name CONTAINS $kw`,
+				{ kw },
+			);
+			for (const row of result[0] ?? []) {
+				const key = String(row.id);
+				if (!seen.has(key)) {
+					seen.add(key);
+					ids.push(row.id);
+				}
+			}
+		}
+		return ids;
+	}
+
+	async function fetchRelationshipsForEntities(entityIds: unknown[], limit = 50): Promise<Relationship[]> {
+		if (entityIds.length === 0) return [];
+		const result = await db.query<[RelationRecord[]]>(
+			`SELECT * FROM relates_to WHERE in IN $ids OR out IN $ids LIMIT ${limit} FETCH in, out`,
+			{ ids: entityIds },
+		);
+		return (result[0] ?? []).map(asRelationship);
+	}
+
 	async function upsertEntity(type: string, name: string): Promise<RecordId<"entity", string>> {
 		const normalizedName = normalizeEntityName(name);
 		const recordId = entityRecord(type, normalizedName);
@@ -275,57 +303,84 @@ export function createProfileStore(dataDir: string, options: ProfileStoreOptions
 
 		async queryByKeywords(keywords: string[], limit = 12): Promise<Relationship[]> {
 			const normalized = keywords.map((k) => k.trim().toLowerCase()).filter(Boolean);
-			const all = await fetchAllRelationships(500);
-			if (all.length === 0) return [];
 
 			if (normalized.length === 0) {
+				const all = await fetchAllRelationships(limit);
 				return all
 					.sort((a, b) => b.memoryStrength - a.memoryStrength || b.confidence - a.confidence)
 					.slice(0, limit);
 			}
 
-			const seedMatches = new Map<string, number>();
-			for (const rel of all) {
-				let score = 0;
-				const haystacks = [rel.source.toLowerCase(), rel.target.toLowerCase(), rel.relation.toLowerCase()];
-				for (const keyword of normalized) {
-					if (haystacks.some((value) => value.includes(keyword))) score += 2;
+			// Stage 1: Find seed entities via indexed query
+			const seedEntityIds = await findSeedEntities(normalized);
+			const seedEntityIdStrings = new Set(seedEntityIds.map(String));
+
+			// Stage 2: Fetch 1-hop relationships from seed entities
+			const hop1 = await fetchRelationshipsForEntities(seedEntityIds, limit * 3);
+
+			// Stage 3: Expand to 2-hop — collect new entity IDs discovered in hop 1
+			const hop2EntityIds: unknown[] = [];
+			const hop2Seen = new Set<string>();
+			for (const rel of hop1) {
+				for (const eid of [rel.sourceId, rel.targetId]) {
+					const key = String(eid);
+					if (!seedEntityIdStrings.has(key) && !hop2Seen.has(key)) {
+						hop2Seen.add(key);
+						// Reconstruct RecordId-compatible references for SurrealDB query
+						hop2EntityIds.push(eid);
+					}
 				}
-				if (score > 0) seedMatches.set(rel.id, score);
+			}
+			const hop2 = await fetchRelationshipsForEntities(hop2EntityIds, limit * 2);
+
+			// Merge and deduplicate
+			const seenIds = new Set<string>();
+			const candidates: Array<{ rel: Relationship; hopDistance: number }> = [];
+			for (const rel of hop1) {
+				const key = String(rel.id);
+				if (!seenIds.has(key)) {
+					seenIds.add(key);
+					candidates.push({ rel, hopDistance: 1 });
+				}
+			}
+			for (const rel of hop2) {
+				const key = String(rel.id);
+				if (!seenIds.has(key)) {
+					seenIds.add(key);
+					candidates.push({ rel, hopDistance: 2 });
+				}
 			}
 
-			const expandedEntityIds = new Set<string>();
-			for (const rel of all) {
-				if (seedMatches.has(rel.id)) {
-					expandedEntityIds.add(rel.sourceId);
-					expandedEntityIds.add(rel.targetId);
-				}
+			if (candidates.length === 0) {
+				// Fallback: return top relationships by strength
+				const all = await fetchAllRelationships(limit);
+				return all
+					.sort((a, b) => b.memoryStrength - a.memoryStrength || b.confidence - a.confidence)
+					.slice(0, limit);
 			}
 
-			const scored = all
-				.map((rel) => {
-					const seedScore = seedMatches.get(rel.id) ?? 0;
-					const hopScore =
-						seedScore > 0
-							? 1
-							: expandedEntityIds.has(rel.sourceId) || expandedEntityIds.has(rel.targetId)
-								? 0.75
-								: 0;
+			// Stage 4: Score results
+			const scored = candidates
+				.map(({ rel, hopDistance }) => {
+					// Keyword match bonus on relationship fields
+					let keywordScore = 0;
+					const haystacks = [rel.source.toLowerCase(), rel.target.toLowerCase(), rel.relation.toLowerCase()];
+					for (const keyword of normalized) {
+						if (haystacks.some((value) => value.includes(keyword))) keywordScore += 2;
+					}
+					const hopScore = 1.0 / (1 + hopDistance);
 					const strengthScore = rel.memoryStrength * 0.5;
 					const confidenceScore = rel.confidence * 0.5;
-					const totalScore = seedScore + hopScore + strengthScore + confidenceScore;
+					const hoursSinceAccess = Math.max(0, (Date.now() - new Date(rel.lastAccessed).getTime()) / 3_600_000);
+					const recencyScore = Math.exp(-hoursSinceAccess / 168);
+					const totalScore = keywordScore + hopScore + strengthScore + confidenceScore + recencyScore;
 					return { rel, totalScore };
 				})
-				.filter((entry) => entry.totalScore > 0)
 				.sort((a, b) => b.totalScore - a.totalScore)
 				.slice(0, limit)
 				.map((entry) => entry.rel);
 
-			return scored.length > 0
-				? scored
-				: all
-						.sort((a, b) => b.memoryStrength - a.memoryStrength || b.confidence - a.confidence)
-						.slice(0, limit);
+			return scored;
 		},
 
 		async reinforce(relationshipId: string) {

@@ -27,7 +27,10 @@ import { createEpisodicStore, type Episode, type EpisodicStore } from "./episodi
 import { embed } from "./embeddings.js";
 import { createProfileStore, type ProfileStore } from "./profile.js";
 import { extractFacts } from "./consolidation.js";
-import { buildContextFrame, MEMORY_INSTRUCTIONS } from "./context-frame.js";
+import { buildContextFrame, buildContextFrameFromRanked, MEMORY_INSTRUCTIONS } from "./context-frame.js";
+import { fusionRank } from "./ranking.js";
+import { maskPii, unmaskPii, deserializeMasks, type PiiMask } from "./pii.js";
+import { createMemoryServer, type MemoryServer } from "./memory-server.js";
 import { join } from "node:path";
 
 const CONSOLIDATION_INTERVAL = 5;
@@ -188,6 +191,7 @@ function sendMemoryMessage(pi: ExtensionAPI, content: string) {
 export default function memoryExtension(pi: ExtensionAPI): void {
 	let episodic: EpisodicStore | null = null;
 	let profile: ProfileStore | null = null;
+	let memoryServer: MemoryServer | null = null;
 	let lastInjectedFrame = "";
 	let lastRecall: RecallDebugInfo | null = null;
 	let consolidationInFlight = false;
@@ -293,8 +297,32 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("memory-server", {
+		description: "Show memory server status and connection info",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			if (!memoryServer || !memoryServer.port) {
+				sendMemoryMessage(pi, "Memory server is not running.");
+				return;
+			}
+			sendMemoryMessage(
+				pi,
+				[
+					`Memory server: http://127.0.0.1:${memoryServer.port}`,
+					`Token: ${memoryServer.token.slice(0, 8)}...`,
+					`Endpoints:`,
+					`  GET /api/memory/episodes?q=<query>&limit=5`,
+					`  GET /api/memory/profile?keywords=<kw1>,<kw2>&limit=10`,
+					`  GET /api/memory/stats`,
+					`Auth: Bearer <token>`,
+				].join("\n"),
+			);
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		try {
+			if (memoryServer) await memoryServer.stop();
 			if (episodic) episodic.close();
 			if (profile) await profile.close();
 
@@ -306,6 +334,21 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 			lastInjectedFrame = "";
 			lastRecall = null;
 			consolidationInFlight = false;
+
+			// Start memory server for cross-application access
+			const openAiKey = await getOpenAiApiKey(ctx);
+			memoryServer = createMemoryServer({
+				episodic,
+				profile,
+				dataDir,
+				embeddingOptions: openAiKey ? { apiKey: openAiKey } : undefined,
+			});
+			try {
+				const { port } = await memoryServer.start();
+				console.log(`[pi-memory] server listening on 127.0.0.1:${port}`);
+			} catch (error) {
+				console.error("[pi-memory] server start failed", error);
+			}
 
 			if (ctx.hasUI) {
 				ctx.ui.setStatus("pi-memory", "🧠 memory ready");
@@ -337,10 +380,9 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 			for (const episode of episodes) episodic.reinforce(episode.id);
 			for (const relationship of relationships) await profile.reinforce(relationship.id);
 
-			const frameResult = buildContextFrame(episodes, relationships, {
+			const ranked = fusionRank(episodes, relationships, keywords);
+			const frameResult = buildContextFrameFromRanked(ranked, {
 				maxTokens: approximatePromptBudget(ctx),
-				maxEpisodes: RETRIEVAL_EPISODE_LIMIT,
-				maxFacts: RETRIEVAL_RELATION_LIMIT,
 			});
 
 			lastInjectedFrame = frameResult.frame;
@@ -370,8 +412,10 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 			const openAiKey = await getOpenAiApiKey(ctx);
 			const episodeText = serializeTurn(event.messages);
 			if (openAiKey && episodeText) {
-				const episodeEmbedding = await embed(episodeText, { apiKey: openAiKey });
-				episodic.insert(episodeText, episodeEmbedding, "pi");
+				const { masked, masks } = maskPii(episodeText);
+				const piiMasksJson = masks.length > 0 ? JSON.stringify(masks) : null;
+				const episodeEmbedding = await embed(masked, { apiKey: openAiKey });
+				episodic.insert(masked, episodeEmbedding, "pi", piiMasksJson);
 			}
 
 			if (episodic.countUnconsolidated() >= CONSOLIDATION_INTERVAL && !consolidationInFlight) {
@@ -384,11 +428,13 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		try {
+			if (memoryServer) await memoryServer.stop();
 			episodic?.close();
 			await profile?.close();
 		} catch (error) {
 			console.error("[pi-memory] session_shutdown failed", error);
 		}
+		memoryServer = null;
 		episodic = null;
 		profile = null;
 	});

@@ -79,7 +79,7 @@ test("schema version manifest is written and survives a process restart without 
 
 		assert.equal(parsed.episodes, 1);
 		assert.equal(parsed.relationships, 1);
-		assert.equal(parsed.versions.episodic, 1);
+		assert.equal(parsed.versions.episodic, 2);
 		assert.equal(parsed.versions.profile, 1);
 	} finally {
 		cleanupTempDir(dir);
